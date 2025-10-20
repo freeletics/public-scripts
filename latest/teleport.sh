@@ -6,6 +6,65 @@ set -uo pipefail
 ORIGINAL_ARGS=("$@")
 
 #############################################
+# Logging setup
+#############################################
+# Define log file path in user's home directory
+LOG_FILE="${HOME}/.teleport_helper.log"
+
+# Create a new log file (clear any existing one)
+: > "$LOG_FILE"
+
+# Start logging session with timestamp and system info
+{
+    echo "=== Teleport Helper Log $(date) ==="
+    echo "System: $(uname -a)"
+    echo "User: $(whoami)"
+    echo "Script: $0"
+    echo "Args: $*"
+    echo "========================================"
+    echo ""
+} >> "$LOG_FILE"
+
+# Create a filter function to strip ANSI escape sequences and control characters
+strip_ansi() {
+    # Remove ANSI escape sequences, cursor movement commands, and other control sequences
+    sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g' | 
+    sed -E 's/\x1B\][0-9;]*[a-zA-Z]//g' | 
+    sed -E 's/\x1B\[[0-9]+n//g' |
+    sed -E 's/\x1B\[[0-9]+;[0-9]+[HfR]//g' |
+    sed -E 's/\x1B\[[0-9]+[ABCDEFGJKST]//g' |
+    sed -E 's/\x1B\[[\?=][0-9;]*[hlm]//g' |
+    sed 's/\r//' |
+    grep -v '^\s*$' # Remove empty lines
+}
+
+# Redirect stderr to both console and log file (with ANSI filtering)
+exec 3>&2 # Save original stderr
+exec 2> >(tee >(strip_ansi >> "$LOG_FILE") >&3)
+
+# Function to log messages
+log_msg() {
+    local level="$1"
+    shift
+    local msg="$*"
+    local timestamp
+    timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    echo "[$timestamp] [$level] $msg" >> "$LOG_FILE"
+}
+
+# Set up error trap to log any errors
+trap_err() {
+    local lineno=$1
+    local command=$2
+    local code=${3:-1}
+    log_msg "ERROR" "Command '$command' failed with exit code $code at line $lineno"
+}
+trap 'trap_err ${LINENO} "$BASH_COMMAND" $?' ERR
+
+# Log start of script execution
+log_msg "INFO" "Script started"
+
+#############################################
 # Config you might want to tweak
 #############################################
 TELEPORT_VERSION="${TELEPORT_VERSION:-18.2.2}"
@@ -31,20 +90,57 @@ KUBE_NAMESPACES=(
 #############################################
 # UI helpers
 #############################################
-bold() { printf "\033[1m%s\033[0m\n" "$*"; }
-warn() { printf "\033[33m%s\033[0m\n" "$*"; }
-err()  { printf "\033[31m%s\033[0m\n" "$*" >&2; }
-have() { command -v "$1" >/dev/null 2>&1; }
+bold() { 
+    printf "\033[1m%s\033[0m\n" "$*"
+    log_msg "INFO" "[BOLD] $*"
+}
+warn() { 
+    printf "\033[33m%s\033[0m\n" "$*"
+    log_msg "WARN" "$*"
+}
+err()  { 
+    printf "\033[31m%s\033[0m\n" "$*" >&2
+    log_msg "ERROR" "$*"
+}
+debug() {
+    # Only log to file, don't display on screen
+    log_msg "DEBUG" "$*"
+}
+have() { 
+    command -v "$1" >/dev/null 2>&1
+    local ret=$?
+    if [ $ret -eq 0 ]; then
+        log_msg "DEBUG" "Command '$1' is available"
+    else
+        log_msg "DEBUG" "Command '$1' is not available"
+    fi
+    return $ret
+}
 
 open_url() {
   local url="$1"
+  log_msg "INFO" "Attempting to open URL: $url"
+  
   if [[ "$(uname -s)" == "Darwin" ]]; then
-    open "$url" >/dev/null 2>&1 || true
+    log_msg "DEBUG" "Using macOS 'open' command"
+    open "$url" >/dev/null 2>&1 || { 
+        log_msg "ERROR" "Failed to open URL with 'open' command"
+        true
+    }
   elif command -v xdg-open >/dev/null 2>&1; then
-    xdg-open "$url" >/dev/null 2>&1 || true
+    log_msg "DEBUG" "Using 'xdg-open' command"
+    xdg-open "$url" >/dev/null 2>&1 || {
+        log_msg "ERROR" "Failed to open URL with 'xdg-open' command"
+        true
+    }
   elif command -v gio >/dev/null 2>&1; then
-    gio open "$url" >/dev/null 2>&1 || true
+    log_msg "DEBUG" "Using 'gio open' command"
+    gio open "$url" >/dev/null 2>&1 || {
+        log_msg "ERROR" "Failed to open URL with 'gio open' command"
+        true
+    }
   else
+    log_msg "WARN" "No suitable command found to open URLs"
     echo "Open this URL in your browser:"
     echo "  $url"
   fi
@@ -55,6 +151,7 @@ WAS_INTERRUPTED=0
 on_sigint() {
   WAS_INTERRUPTED=1
   echo
+  log_msg "INFO" "User interrupted execution (Ctrl-C)"
   warn "Interrupted. Returning to menu..."
 }
 trap 'on_sigint' INT
@@ -62,18 +159,26 @@ trap 'on_sigint' INT
 pause() {
   if [[ "${WAS_INTERRUPTED:-0}" -eq 1 ]]; then
     WAS_INTERRUPTED=0
+    log_msg "DEBUG" "Pause skipped due to previous interruption"
     return
   fi
+  log_msg "DEBUG" "Pausing for user input"
   read -r -p "Press ENTER to continue..."
+  log_msg "DEBUG" "User continued after pause"
 }
 
 # Wrap long-running commands so Ctrl-C is "expected"
 run_blocking() {
+  log_msg "INFO" "Running command: $*"
   set +e
-  "$@"
+  "$@" 2> >(tee -a "$LOG_FILE" >&2)
   local status=$?
   set -e
-  [[ $status -eq 130 ]] && WAS_INTERRUPTED=1
+  log_msg "INFO" "Command completed with status: $status"
+  [[ $status -eq 130 ]] && {
+    WAS_INTERRUPTED=1
+    log_msg "INFO" "Command was interrupted by user"
+  }
   return $status
 }
 
@@ -394,6 +499,21 @@ need_kubectl() {
   return 0
 }
 
+need_jq() {
+  if ! have jq; then
+    err "jq not found. Please install jq before using Kubernetes options."
+    if [[ "$OS" == "macos" ]]; then
+      echo "  macOS (Homebrew): brew install jq"
+    else
+      echo "  Ubuntu/Debian: sudo apt-get install -y jq"
+      echo "  Fedora/RHEL/CentOS: sudo dnf install jq / sudo yum install jq"
+    fi
+    pause
+    return 1
+  fi
+  return 0
+}
+
 kube_login() {
   local cluster="$1"
   bold "tsh kube login ${cluster}"
@@ -423,9 +543,14 @@ list_pods_in_namespace() {
 # Return only pods suitable for exec: Running + has 'rails' container
 list_exec_pods_in_namespace() {
   local ctx="$1" ns="$2"
+  need_jq || return 1
+  
   # Get pods with status and container info in one command for better performance
-  kubectl ${ctx:+--context "$ctx"} -n "$ns" get pods -o custom-columns="NAME:.metadata.name,STATUS:.status.phase,CONTAINERS:.spec.containers[*].name" --no-headers 2>/dev/null | 
-    grep "Running" | grep -i "rails" | awk '{print $1}'
+  kubectl ${ctx:+--context "$ctx"} -n "$ns" get pods -o json 2>/dev/null | 
+    jq -r '.items[] | 
+           select(.status.phase=="Running") | 
+           select(.spec.containers[].name=="rails") | 
+           .metadata.name'
 }
 
 #############################################
@@ -458,9 +583,12 @@ kube_logs_flow() {
   [[ -z "${pod:-}" ]] && return 0
 
   # Check container with direct access to avoid additional kubectl calls
-  if ! kubectl ${ctx:+--context "$ctx"} -n "$ns" get pod "$pod" -o custom-columns=":spec.containers[*].name" --no-headers 2>/dev/null |
-       grep -qE '(^| )rails( |$)'; then
+  container_list=$(kubectl ${ctx:+--context "$ctx"} -n "$ns" get pod "$pod" -o jsonpath="{.spec.containers[*].name}" 2>/dev/null)
+  debug "Available containers in pod: $container_list"
+  
+  if ! echo "$container_list" | grep -qE '(^|,| )rails($|,| )'; then
     err "Container 'rails' not found in $pod. Aborting logs."
+    debug "Containers in pod are: $container_list"
     pause
     return 0
   fi
@@ -499,6 +627,17 @@ kube_exec_flow() {
   pod="$(list_exec_pods_in_namespace "${ctx:-}" "$ns" | fzf --prompt="Pod in $ns (exec) > " --height=25 --border || true)"
   [[ -z "${pod:-}" ]] && return 0
 
+  # Double-check the container exists (better safe than sorry)
+  container_list=$(kubectl ${ctx:+--context "$ctx"} -n "$ns" get pod "$pod" -o jsonpath="{.spec.containers[*].name}" 2>/dev/null)
+  debug "Available containers in pod: $container_list"
+  
+  if ! echo "$container_list" | grep -qE '(^|,| )rails($|,| )'; then
+    err "Container 'rails' not found in $pod. Aborting exec."
+    debug "Containers in pod are: $container_list"
+    pause
+    return 0
+  fi
+
   bold "Exec into $pod (ns=$ns) container 'rails' using /bin/bash"
   warn "Inside the remote shell, use 'exit' or Ctrl-D to return to the menu."
 
@@ -509,6 +648,312 @@ kube_exec_flow() {
     return
   fi
   pause
+}
+
+#############################################
+# System check functions
+#############################################
+# Emoji indicators for system checks
+EMOJI_SUCCESS="✅"
+EMOJI_WARNING="⚠️"
+EMOJI_ERROR="❌"
+EMOJI_INFO="ℹ️"
+EMOJI_PENDING="🔄"
+
+# Check if the Teleport proxy is reachable (NETWORK CONNECTIVITY ONLY)
+check_teleport_proxy() {
+  echo -n "Teleport proxy ($TELEPORT_PROXY) reachable: "
+  
+  # Use existing global variables and proxy_reachable function
+  # Ensure proxy host and port are set correctly
+  parse_proxy
+  
+  # Try simple TCP connection test without checking login status
+  if proxy_reachable; then
+    echo "$EMOJI_SUCCESS Network connectivity confirmed"
+    return 0
+  else
+    echo "$EMOJI_ERROR No network connectivity - check VPN or network connection"
+    log_msg "DEBUG" "Failed to connect to proxy ${PROXY_HOST}:${PROXY_PORT}"
+    return 1
+  fi
+}
+
+# Check DNS settings
+check_dns_settings() {
+  echo -n "DNS settings: "
+  local dns_servers=$(cat /etc/resolv.conf | grep -E '^nameserver' | awk '{print $2}')
+  
+  if echo "$dns_servers" | grep -q "10.130.0.2"; then
+    echo "$EMOJI_SUCCESS Using expected nameserver (10.130.0.2)"
+    return 0
+  else
+    echo "$EMOJI_WARNING Not using expected nameserver 10.130.0.2"
+    echo "  Current nameservers: $dns_servers"
+    return 1
+  fi
+}
+
+# Check if user is logged in to Teleport
+check_teleport_login() {
+  echo -n "Teleport login status: "
+  
+  if ! have tsh; then
+    echo "$EMOJI_ERROR tsh command not found"
+    return 1
+  fi
+  
+  local login_status=$(tsh status 2>&1)
+  if echo "$login_status" | grep -q "You are not logged in"; then
+    echo "$EMOJI_WARNING Not logged in"
+    return 1
+  else
+    # Try multiple methods to extract username
+    local username=""
+    # Method 1: Try getting from status directly
+    username=$(tsh status | grep -E '^>|^Profile' | grep -oE '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' | head -1)
+    
+    # Method 2: If empty, try getting from tsh status Username field
+    if [[ -z "$username" ]]; then
+      username=$(tsh status | grep -i "username" | awk '{print $2}')
+    fi
+    
+    # Method 3: If still empty, try from whoami command
+    if [[ -z "$username" ]]; then
+      username=$(tsh whoami 2>/dev/null || echo "")
+    fi
+    
+    # Fallback
+    if [[ -z "$username" ]]; then
+      username="$(whoami)@$(tsh status | grep -i "proxy" | awk '{print $2}')"
+    fi
+    
+    echo "$EMOJI_SUCCESS Logged in as $username"
+    return 0
+  fi
+}
+
+# Check for important tools
+check_required_tools() {
+  local missing=0
+  local all_tools="tsh kubectl jq nc curl grep awk sed"
+  local missing_tools=""
+  local present_tools=""
+  
+  # First check all tools
+  for tool in $all_tools; do
+    if have "$tool"; then
+      present_tools="$present_tools $tool"
+    else
+      missing_tools="$missing_tools $tool"
+      missing=$((missing + 1))
+    fi
+  done
+  
+  # Report on present tools
+  if [[ -n "$present_tools" ]]; then
+    echo "$EMOJI_SUCCESS Present:$(echo $present_tools | sed 's/ /, /g')"
+  fi
+  
+  # Report on missing tools
+  if [[ -n "$missing_tools" ]]; then
+    echo "$EMOJI_ERROR Missing:$(echo $missing_tools | sed 's/ /, /g')"
+    echo "  Please install missing tools for full functionality"
+  fi
+  
+  return $missing
+}
+
+# Check if user can access DBs
+check_database_access() {
+  echo -n "Database access: "
+  
+  # Try to list databases to verify access
+  local result
+  result=$(tsh db ls 2>&1)
+  local status_code=$?
+  
+  if [[ $status_code -ne 0 ]]; then
+    echo "$EMOJI_ERROR Cannot access databases (command failed)"
+    echo "  Error: $result"
+    return 1
+  elif echo "$result" | grep -qE "error|denied|not found"; then
+    echo "$EMOJI_ERROR Cannot access databases"
+    echo "  Error: $result"
+    return 1
+  elif echo "$result" | grep -q "$DB_TUNNEL_INTEGRATION\|$DB_TUNNEL_PRODUCTION"; then
+    echo "$EMOJI_SUCCESS Can access required databases"
+    # List the databases found
+    echo "  Databases: $(echo "$result" | grep -E "$DB_TUNNEL_INTEGRATION|$DB_TUNNEL_PRODUCTION" | awk '{print $1}' | paste -sd "," -)"
+    return 0
+  else
+    echo "$EMOJI_WARNING Can access databases but expected tunnels not found"
+    echo "  Available databases: $(echo "$result" | grep -v "^NAME" | awk '{print $1}' | paste -sd "," -)"
+    return 1
+  fi
+}
+
+# Check if user can access Kubernetes
+check_kubernetes_access() {
+  echo -n "Kubernetes access: "
+  
+  # Try to list clusters to verify access
+  local result
+  result=$(tsh kube ls 2>&1)
+  local status_code=$?
+  
+  if [[ $status_code -ne 0 ]]; then
+    echo "$EMOJI_ERROR Cannot access Kubernetes clusters (command failed)"
+    echo "  Error: $result"
+    return 1
+  elif echo "$result" | grep -qE "error|denied|not found"; then
+    echo "$EMOJI_ERROR Cannot access Kubernetes clusters"
+    echo "  Error: $result"
+    return 1
+  elif echo "$result" | grep -q "$KUBE_CLUSTER_INTEGRATION\|$KUBE_CLUSTER_PRODUCTION"; then
+    echo "$EMOJI_SUCCESS Can access required Kubernetes clusters"
+    # List the clusters found
+    echo "  Clusters: $(echo "$result" | grep -E "$KUBE_CLUSTER_INTEGRATION|$KUBE_CLUSTER_PRODUCTION" | awk '{print $1}' | paste -sd "," -)"
+    return 0
+  else
+    echo "$EMOJI_WARNING Can access Kubernetes but expected clusters not found"
+    echo "  Available clusters: $(echo "$result" | grep -v "^NAME" | awk '{print $1}' | paste -sd "," -)"
+    return 1
+  fi
+}
+
+# Check MFA TOTP status
+check_mfa_totp() {
+  echo -n "MFA TOTP: "
+  
+  local result
+  result=$(tsh mfa ls 2>&1)
+  
+  if [[ $? -ne 0 ]]; then
+    echo "$EMOJI_ERROR Failed to check MFA status"
+    return 1
+  elif echo "$result" | grep -q "TOTP"; then
+    local device=$(echo "$result" | grep "TOTP" | awk '{print $1}')
+    echo "$EMOJI_SUCCESS Configured ($device)"
+    return 0
+  else
+    echo "$EMOJI_ERROR Not configured (required)"
+    return 1
+  fi
+}
+
+# Check Touch ID MFA status
+check_touch_id() {
+  echo -n "Touch ID MFA: "
+  
+  # Check if platform supports Touch ID
+  if [[ "$(uname -s)" != "Darwin" ]]; then
+    echo "$EMOJI_INFO Not available on this platform"
+    return 0
+  fi
+  
+  local result
+  result=$(tsh mfa ls 2>&1)
+  
+  if [[ $? -ne 0 ]]; then
+    echo "$EMOJI_ERROR Failed to check MFA status"
+    return 1
+  elif echo "$result" | grep -qiE "WebAuthn|TouchID|Passkey"; then
+    local device=$(echo "$result" | grep -iE "WebAuthn|TouchID|Passkey" | awk '{print $1}')
+    echo "$EMOJI_SUCCESS Configured ($device)"
+    return 0
+  else
+    echo "$EMOJI_WARNING Not configured (recommended for macOS users)"
+    return 1
+  fi
+}
+
+# Run all basic system checks and return overall status
+run_basic_system_checks() {
+  local status=0
+  
+  bold "Running basic system checks..."
+  echo
+  
+  bold "Network Connectivity:"
+  check_teleport_proxy || status=1
+  check_dns_settings || status=1
+  echo
+  
+  bold "Teleport Status:"
+  check_teleport_login || status=1
+  echo
+  
+  bold "Required Tools:"
+  check_required_tools || status=1
+  
+  return $status
+}
+
+# Run advanced system checks (only if logged in)
+run_advanced_system_checks() {
+  local status=0
+  
+  bold "Running advanced system checks (requires active Teleport login)..."
+  echo
+  
+  # Only run these checks if the user is logged in
+  if ! check_teleport_login > /dev/null; then
+    echo "$EMOJI_WARNING Skipping advanced checks - not logged in to Teleport"
+    return 1
+  fi
+  
+  bold "Resource Access:"
+  check_database_access || status=1
+  check_kubernetes_access || status=1
+  echo
+  
+  bold "Security Configuration:"
+  check_mfa_totp || status=1
+  check_touch_id || status=1
+  
+  return $status
+}
+
+# Main system check function
+system_check() {
+  clear
+  bold "System Check Results"
+  echo "======================="
+  echo "Date: $(date)"
+  echo "User: $(whoami)"
+  echo "Host: $(hostname)"
+  echo "OS: $(uname -s) $(uname -r)"
+  echo "======================="
+  echo
+  
+  local basic_status=0
+  local advanced_status=0
+  
+  run_basic_system_checks || basic_status=1
+  echo
+  run_advanced_system_checks || advanced_status=1
+  
+  echo
+  echo "======================="
+  bold "Summary:"
+  
+  if [[ $basic_status -eq 0 && $advanced_status -eq 0 ]]; then
+    bold "$EMOJI_SUCCESS All system checks passed!"
+  elif [[ $basic_status -eq 0 && $advanced_status -ne 0 ]]; then
+    bold "$EMOJI_WARNING Basic checks passed but some advanced checks failed"
+    echo "    - Check MFA configuration settings"
+    echo "    - Verify access to required resources"
+  else
+    bold "$EMOJI_ERROR System check found issues that need attention"
+    echo "    - Basic connectivity or tool issues detected"
+    echo "    - Please resolve these before attempting to use Teleport"
+  fi
+  echo
+  
+  # Log the check results
+  log_msg "INFO" "System check completed. Basic checks: $([[ $basic_status -eq 0 ]] && echo "PASS" || echo "FAIL"), Advanced checks: $([[ $advanced_status -eq 0 ]] && echo "PASS" || echo "FAIL")"
+  echo
 }
 
 #############################################
@@ -526,8 +971,10 @@ main_menu() {
         "K8s: Login Production (${KUBE_CLUSTER_PRODUCTION})" \
         "K8s: Logs (env → ns → pod 'rails')" \
         "K8s: Exec (env → ns → pod 'rails')" \
+        "System Check (connectivity, access, MFA status)" \
         "Install Shell Shortcuts (k alias, tp login/logout, kns)" \
         "Check for Updates" \
+        "Report a Bug" \
         "Teleport Logout" \
         "Quit" \
       | fzf --prompt="Teleport Helper > " --height=20 --border
@@ -541,8 +988,10 @@ main_menu() {
       "K8s: Login Production"*)  kube_login "$KUBE_CLUSTER_PRODUCTION"; pause ;;
       "K8s: Logs"*)              kube_logs_flow ;;
       "K8s: Exec"*)              kube_exec_flow ;;
+      "System Check"*)          system_check; pause ;;
       "Install Shell Shortcuts"*) install_shell_shortcuts ;;
       "Check for Updates")       check_and_update_script ;;
+      "Report a Bug")            create_bug_report ;;
       "Teleport Logout")         tsh_logout ;;
       "Quit")                    break ;;
       "" )                       ;;   # cancelled -> redisplay menu
@@ -671,6 +1120,7 @@ install_shell_shortcuts() {
       tp_function="
 # tp - Teleport helper function
 tp() {
+  local script_path=\"$script_path\"
   case \"\$1\" in"
       
       if [[ "$install_tp_login" == "y" ]]; then
@@ -686,6 +1136,9 @@ tp() {
         tp_function+="
     logout)
       tsh logout
+      ;;
+    check)
+      bash \"\$script_path\" --system-check
       ;;"
         echo "Added: tp logout - for quick Teleport logout"
       fi
@@ -700,6 +1153,8 @@ tp() {
       echo \"  login   - Login to Teleport\""
       [[ "$install_tp_logout" == "y" ]] && tp_function+="
       echo \"  logout  - Logout from Teleport\""
+      tp_function+="
+      echo \"  check   - Run system checks (connectivity, access, MFA)\""
       
       tp_function+="
       return 1
@@ -779,6 +1234,7 @@ kns() {
     if [[ "$install_tp_script_command" == "y" ]]; then
         echo "  tp          - Run this teleport helper script directly"
         echo "  tp update   - Check for and install script updates"
+        echo "  tp report   - Create and send a bug report"
     fi
   else
     echo "No shortcuts selected for installation."
@@ -792,6 +1248,218 @@ kns() {
 #############################################
 detect_os
 require_sudo
+#############################################
+# Bug reporting functionality 
+#############################################
+create_bug_report() {
+  log_msg "INFO" "Creating bug report"
+  
+  # Gather additional system information
+  local report_file="${HOME}/.teleport_helper_report.txt"
+  
+  # Check if we have any errors in the log
+  local error_count=0
+  if [[ -f "$LOG_FILE" ]]; then
+    # Use wc -l to count lines, safer than grep -c which can return non-numeric strings
+    error_count=$(grep -E '\[ERROR\]' "$LOG_FILE" | wc -l | tr -d ' ')
+    # Ensure error_count is a number
+    if ! [[ "$error_count" =~ ^[0-9]+$ ]]; then
+      error_count=0
+    fi
+  fi
+  
+  # Create the detailed report file
+  {
+    echo "=== TELEPORT HELPER BUG REPORT ==="
+    echo "Generated: $(date)"
+    echo "Script Version: $(grep -m 1 'TELEPORT_VERSION=' "$0" | cut -d '"' -f 2 || echo "Unknown")"
+    echo ""
+    
+    echo "=== SYSTEM INFORMATION ==="
+    echo "OS: $OS"
+    echo "Arch: $ARCH"
+    echo "Kernel: $(uname -r)"
+    echo "User: $(whoami)"
+    echo "Shell: $SHELL"
+    echo ""
+    
+    echo "=== TELEPORT INFORMATION ==="
+    # Get version in a safer way
+    TSH_VERSION=$(tsh version 2>/dev/null | head -1 | strip_ansi || echo "Not installed or not found")
+    echo "Teleport Client Version: $TSH_VERSION"
+    echo "Teleport Proxy: ${TELEPORT_PROXY}"
+    echo "Teleport Auth: ${TELEPORT_AUTH}"
+    echo ""
+    
+    echo "=== INSTALLED DEPENDENCIES ==="
+    # Get versions with proper error handling
+    KUBECTL_VERSION=$(kubectl version --client 2>/dev/null | grep -o 'Client.*' | strip_ansi || echo "Not installed")
+    FZF_VERSION=$(fzf --version 2>/dev/null | strip_ansi || echo "Not installed")
+    CURL_VERSION=$(curl --version 2>/dev/null | head -1 | strip_ansi || echo "Not installed")
+    
+    echo "kubectl: $KUBECTL_VERSION"
+    echo "fzf: $FZF_VERSION"
+    echo "curl: $CURL_VERSION"
+    echo ""
+    
+    if [[ $error_count -gt 0 ]]; then
+      echo "=== ERRORS FOUND ($error_count total) ==="
+      grep -E '\[ERROR\]' "$LOG_FILE" | strip_ansi || echo "No errors in log (unexpected condition)"
+      echo ""
+    fi
+    
+    echo "=== COMPLETE LOG (ANSI Escape Codes Removed) ==="
+    echo "Log file: $LOG_FILE"
+    echo "----------------------------------------"
+    if [[ -f "$LOG_FILE" ]]; then
+      # Make sure we clean up the log to be plaintext
+      cat "$LOG_FILE" | strip_ansi
+    else
+      echo "Log file not found"
+    fi
+  } > "$report_file"
+  
+  # Make the report file readable
+  chmod 644 "$report_file"
+  
+  # Show the report creation summary
+  clear
+  bold "=== BUG REPORT CREATED ==="
+  echo
+  echo "Report file: $report_file"
+  echo "File size: $(du -h "$report_file" | awk '{print $1}' 2>/dev/null || echo "Unknown")"
+  
+  # Show error summary if any
+  if [[ $error_count -gt 0 ]]; then
+    echo
+    bold "Found $error_count errors in the log:"
+    grep -E '\[ERROR\]' "$LOG_FILE" | head -5
+    [[ $error_count -gt 5 ]] && echo "... and $(($error_count - 5)) more errors (see full report) ..."
+  fi
+  
+  echo
+  bold "What would you like to do with this report?"
+  echo "1. Email it to operations@freeletics.com (recommended)"
+  echo "2. View the report contents"
+  echo "3. Return to the main menu"
+  echo
+  
+  read -r -p "Enter your choice (1-3): " choice
+  
+  case "$choice" in
+    1)
+      send_bug_report "$report_file"
+      ;;
+    2)
+      # View the report
+      if command -v less >/dev/null 2>&1; then
+        less "$report_file"
+      else
+        # Fall back to more or just cat
+        if command -v more >/dev/null 2>&1; then
+          more "$report_file"
+        else
+          cat "$report_file"
+        fi
+      fi
+      
+      # After viewing, ask if user wants to send
+      echo
+      read -r -p "Would you like to email this report now? [Y/n]: " send_choice
+      case "${send_choice:-y}" in
+        [yY]|[yY][eE][sS]|"")
+          send_bug_report "$report_file"
+          ;;
+        *)
+          echo "Report not sent. You can manually email the report file to operations@freeletics.com"
+          echo "Report location: $report_file"
+          ;;
+      esac
+      ;;
+    *)
+      echo "Report not sent. You can manually email the report file to operations@freeletics.com"
+      echo "Report location: $report_file"
+      ;;
+  esac
+  
+  pause
+}
+
+send_bug_report() {
+  local report_file="$1"
+  local subject="Teleport Helper Bug Report - $(date +%Y-%m-%d)"
+  local recipient="operations@freeletics.com"
+  
+  log_msg "INFO" "Attempting to send bug report to $recipient"
+  
+  # Since mailto: encoding is problematic, we'll display the contents
+  # and give clearer instructions for all platforms
+  
+  # Check if we have any log entries that indicate errors
+  local error_count=0
+  if [[ -f "$LOG_FILE" ]]; then
+    error_count=$(grep -c -E '\[ERROR\]' "$LOG_FILE" || echo "0")
+  fi
+  
+  clear
+  bold "=== BUG REPORT READY ==="
+  echo
+  echo "To: $recipient"
+  echo "Subject: $subject"
+  echo
+  if [[ $error_count -gt 0 ]]; then
+    bold "Found $error_count errors in the log file:"
+    echo
+    grep -E '\[ERROR\]' "$LOG_FILE" | tail -10
+    [[ $error_count -gt 10 ]] && echo "... and $(($error_count - 10)) more errors ..."
+    echo
+  fi
+  
+  bold "What happens next:"
+  echo "1. When you press ENTER, your default email client will open."
+  echo "2. The email subject is already set, but you'll need to:"
+  echo "   - Describe the issue you encountered"
+  echo "   - List the steps to reproduce"
+  echo "   - Attach the full bug report file: $report_file"
+  echo
+  bold "Important: Please attach the bug report file!"
+  echo "Report file location: $report_file"
+  echo
+  
+  read -r -p "Press ENTER to open your email client..." || true
+  
+  # Try platform-specific email clients first
+  if [[ "$OS" == "macos" ]]; then
+    # For macOS, try to use native Mail.app with a minimal body
+    open "mailto:${recipient}?subject=${subject}&body=Please see attached bug report file." || open_email_fallback "$recipient" "$subject" "$report_file"
+  elif command -v xdg-email >/dev/null 2>&1; then
+    # For Linux with xdg-email
+    xdg-email --subject "$subject" --body "Please see attached bug report file." "$recipient" || open_email_fallback "$recipient" "$subject" "$report_file"
+  else
+    # Fall back to web-based email
+    open_email_fallback "$recipient" "$subject" "$report_file"
+  fi
+}
+
+open_email_fallback() {
+  local recipient="$1"
+  local subject="$2"
+  local report_file="$3"
+  
+  # As fallback, display instructions and open a webmail service
+  bold "Could not open native email client. Using web email instead."
+  echo
+  echo "Please remember to:"
+  echo "1. Set the recipient to: $recipient"
+  echo "2. Set the subject to: $subject"
+  echo "3. Attach the bug report file: $report_file"
+  echo
+  
+  # Try to open a webmail service
+  read -r -p "Press ENTER to open Gmail (or Ctrl+C to cancel)..." || true
+  open_url "https://mail.google.com/mail/?view=cm&fs=1&to=${recipient}&su=${subject}"
+}
+
 #############################################
 # Self-update functionality
 #############################################
@@ -898,6 +1566,15 @@ process_args() {
       check_and_update_script
       exit 0
       ;;
+    check)
+      system_check
+      pause
+      exit 0
+      ;;
+    report)
+      create_bug_report
+      exit 0
+      ;;
     *)
       # No arguments or unknown argument, continue to interactive menu
       ;;
@@ -919,18 +1596,32 @@ if [[ $# -gt 0 ]]; then
     echo "Usage: $(basename "$0") [command]"
     echo ""
     echo "Available commands:"
-    echo "  login    - Login to Teleport"
-    echo "  logout   - Logout from Teleport"
-    echo "  update   - Check for and install updates"
-    echo "  help     - Show this help message"
+    echo "  login            - Login to Teleport"
+    echo "  logout           - Logout from Teleport"
+    echo "  update           - Check for and install updates"
+    echo "  report           - Create and send a bug report"
+    echo "  --system-check   - Run system checks"
+    echo "  help             - Show this help message"
     echo ""
     echo "Without arguments, shows interactive menu."
+    exit 0
+  elif [[ "$1" == "--system-check" ]]; then
+    system_check
+    pause
     exit 0
   fi
   
   # Process other arguments
   process_args "$@"
 fi
+
+# Set up exit logging
+log_exit() {
+  log_msg "INFO" "Script exiting with status code $?"
+  log_msg "INFO" "Total execution time: $SECONDS seconds"
+  log_msg "INFO" "==== End of session ===="
+}
+trap log_exit EXIT
 
 # Start the interactive menu
 main_menu
