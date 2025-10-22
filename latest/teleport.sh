@@ -4,12 +4,46 @@ set -uo pipefail
 
 # Store original arguments for potential restart after update
 ORIGINAL_ARGS=("$@")
+MAIN_PID=${BASHPID:-$$}
+
+#############################################
+# CONFIGURABLE ENVIRONMENT VARIABLES GUIDE
+#############################################
+# This script can be customized by setting environment variables before running.
+# Example: 
+#   DEFAULT_CONTAINER=app DB_PORT=5433 bash teleport.sh
+#
+# Available configuration options:
+#
+# Teleport configuration:
+# - TELEPORT_VERSION: Version of teleport to use (default: 18.2.2)
+# - TELEPORT_PROXY: Teleport proxy address (default: teleport.auth.freeletics.com:443)
+# - TELEPORT_AUTH: Auth role to use (default: Engineering)
+#
+# Database configuration:
+# - DB_NAME_INTEGRATION: Integration database name (default: bodyweight)
+# - DB_NAME_PRODUCTION: Production database name (default: bodyweight)
+# - DB_TUNNEL_INTEGRATION: Integration tunnel name (default: fl-integration-cluster)
+# - DB_TUNNEL_PRODUCTION: Production tunnel name (default: fl-prod-aurora)
+# - DB_PORT: Database port (default: 5432)
+# - DB_USER_INTEGRATION: Default integration DB user (default: root-teleport)
+# - DB_USER_PRODUCTION: Default production DB user (default: root)
+#
+# Kubernetes configuration:
+# - KUBE_CLUSTER_INTEGRATION: Integration cluster name (default: fl-integration-12012024)
+# - KUBE_CLUSTER_PRODUCTION: Production cluster name (default: fl-production-13022024)
+# - DEFAULT_CONTAINER: Container name to use for logs/exec operations (default: rails)
+# - KUBE_NAMESPACES_LIST: Space-separated list of namespaces to show (default: see below)
 
 #############################################
 # Logging setup
 #############################################
 # Define log file path in user's home directory
 LOG_FILE="${HOME}/.teleport_helper.log"
+LOG_LEVEL="${LOG_LEVEL:-INFO}"  # Can be DEBUG, INFO, WARN, ERROR
+
+# Control whether to log fzf UI related output (should be kept off to avoid clutter)
+FILTER_FZF="${FILTER_FZF:-1}"   # Set to 0 only for debugging fzf issues
 
 # Create a new log file (clear any existing one)
 : > "$LOG_FILE"
@@ -27,26 +61,67 @@ LOG_FILE="${HOME}/.teleport_helper.log"
 
 # Create a filter function to strip ANSI escape sequences and control characters
 strip_ansi() {
+    # First filter out fzf-specific UI elements and lines before parsing the rest
+    grep -v -E '^(\[|\s*\[|\s*>)' |                    # fzf selection indicators and prompts
+    grep -v -E '^[│└─┌┐┘┤┬┴┼┼─┴┬│┐┌┘└][└─┌┐┘┤┬┴┼]*$' | # Box drawing characters
+    grep -v -E '^> ' |                                  # fzf prompts
+    grep -v -E '^\s*[0-9]+/[0-9]+' |                    # fzf counters
+    grep -v -E '^  ([▶⣿▉⣾⣽⣻⢿⡿⣟⣯⡷⣿])' |               # fzf loading indicators
+    grep -v -E '^(\(|.*\)|\[|\])$' |                    # Single brackets/parentheses lines
+    
+    # Filter out interactive keyboard inputs that might have leaked into the log
+    grep -v -E '^\^\[\[' |                              # Arrow key sequences
+    grep -v -E '^\^H|^\^C|^\^D|^\^E|^\^R' |            # Control character sequences
+    
     # Remove ANSI escape sequences, cursor movement commands, and other control sequences
-    sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g' | 
-    sed -E 's/\x1B\][0-9;]*[a-zA-Z]//g' | 
-    sed -E 's/\x1B\[[0-9]+n//g' |
-    sed -E 's/\x1B\[[0-9]+;[0-9]+[HfR]//g' |
-    sed -E 's/\x1B\[[0-9]+[ABCDEFGJKST]//g' |
-    sed -E 's/\x1B\[[\?=][0-9;]*[hlm]//g' |
-    sed 's/\r//' |
-    grep -v '^\s*$' # Remove empty lines
+    sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g' |              # Standard ANSI color/formatting
+    sed -E 's/\x1B\][0-9;]*[a-zA-Z]//g' |              # Terminal title and other OSC sequences
+    sed -E 's/\x1B\[[0-9]+n//g' |                      # Device status report
+    sed -E 's/\x1B\[[0-9]+;[0-9]+[HfR]//g' |           # Cursor positioning
+    sed -E 's/\x1B\[[0-9]+[ABCDEFGJKST]//g' |          # Cursor movement
+    sed -E 's/\x1B\[[\?=][0-9;]*[hlm]//g' |            # Terminal mode settings
+    sed -E 's/\x1B[=>]//g' |                           # Application keypad/cursor keys
+    sed -E 's/\x1B[()][AB012]//g' |                    # Character set selection
+    sed -E 's/\r$//g' |                                # Trailing carriage returns
+    sed -E 's/\x7F//g' |                               # Delete characters
+    sed -E 's/\x08//g' |                               # Backspace characters
+    
+    # Final cleanup
+    grep -v -E '^\s*([│└─┌┐┘┤┬┴┼]|\||-)' |             # Any remaining UI elements
+    grep -v '^\s*$'                                    # Remove empty lines
 }
 
 # Redirect stderr to both console and log file (with ANSI filtering)
 exec 3>&2 # Save original stderr
 exec 2> >(tee >(strip_ansi >> "$LOG_FILE") >&3)
 
-# Function to log messages
+# Add a log category specifically for fzf operations to help with debugging
+log_fzf() {
+    # Only log fzf operations at debug level, not in normal logs
+    if [[ "${DEBUG_FZF:-0}" -eq 1 ]]; then
+        log_msg "FZF" "$*"
+    fi
+}
+
+# Function to log messages based on configured log level
 log_msg() {
     local level="$1"
     shift
     local msg="$*"
+    
+    # Skip logging based on log level
+    case "$LOG_LEVEL" in
+        INFO)  [[ "$level" == "DEBUG" ]] && return ;;
+        WARN)  [[ "$level" == "DEBUG" || "$level" == "INFO" ]] && return ;;
+        ERROR) [[ "$level" != "ERROR" ]] && return ;;
+    esac
+    
+    # Check for fzf-related messages
+    if [[ "$FILTER_FZF" -eq 1 && "$msg" == *"fzf"* && "$level" != "ERROR" ]]; then
+        # Only log fzf-related messages at DEBUG level
+        [[ "$LOG_LEVEL" != "DEBUG" ]] && return
+    fi
+    
     local timestamp
     timestamp=$(date "+%Y-%m-%d %H:%M:%S")
     echo "[$timestamp] [$level] $msg" >> "$LOG_FILE"
@@ -67,25 +142,44 @@ log_msg "INFO" "Script started"
 #############################################
 # Config you might want to tweak
 #############################################
+# =============================================
+# CONFIGURABLE ENVIRONMENT VARIABLES
+# Override these by setting them before running the script
+# =============================================
+
+# Teleport configuration
 TELEPORT_VERSION="${TELEPORT_VERSION:-18.2.2}"
 TELEPORT_PROXY="${TELEPORT_PROXY:-teleport.auth.freeletics.com:443}"
 TELEPORT_AUTH="${TELEPORT_AUTH:-Engineering}"
 TELEPORT_EDITION="${TELEPORT_EDITION:-oss}"   # linux installer edition (oss/ent/etc.)
 
-DB_NAME_INTEGRATION="bodyweight"
-DB_TUNNEL_INTEGRATION="fl-integration-cluster"
+# Database configuration
+DB_NAME_INTEGRATION="${DB_NAME_INTEGRATION:-bodyweight}"
+DB_TUNNEL_INTEGRATION="${DB_TUNNEL_INTEGRATION:-fl-integration-cluster}"
+DB_NAME_PRODUCTION="${DB_NAME_PRODUCTION:-bodyweight}"
+DB_TUNNEL_PRODUCTION="${DB_TUNNEL_PRODUCTION:-fl-prod-aurora}"
+DB_PORT="${DB_PORT:-5432}"  # Default PostgreSQL port
+DB_USER_INTEGRATION="${DB_USER_INTEGRATION:-root-teleport}"  # Default user for integration DB
+DB_USER_PRODUCTION="${DB_USER_PRODUCTION:-root}"  # Default user for production DB
 
-DB_NAME_PRODUCTION="bodyweight"
-DB_TUNNEL_PRODUCTION="fl-prod-aurora"
+# Kubernetes cluster configuration
+KUBE_CLUSTER_INTEGRATION="${KUBE_CLUSTER_INTEGRATION:-fl-integration-12012024}"
+KUBE_CLUSTER_PRODUCTION="${KUBE_CLUSTER_PRODUCTION:-fl-production-13022024}"
 
-KUBE_CLUSTER_INTEGRATION="fl-integration-12012024"
-KUBE_CLUSTER_PRODUCTION="fl-production-13022024"
+# Default container name for operations
+DEFAULT_CONTAINER="${DEFAULT_CONTAINER:-rails}"
 
-# Namespaces to browse for logs/exec
-KUBE_NAMESPACES=(
-  audit bodyweight coach coach-plus messaging nutrition
-  payment social tracking user web-blog web-service-main web-ssr
-)
+# Default namespaces to browse for logs/exec
+# Can be overridden by setting KUBE_NAMESPACES_LIST as a space-separated string
+# Example: KUBE_NAMESPACES_LIST="namespace1 namespace2 namespace3"
+if [[ -n "${KUBE_NAMESPACES_LIST:-}" ]]; then
+  read -r -a KUBE_NAMESPACES <<< "$KUBE_NAMESPACES_LIST"
+else
+  KUBE_NAMESPACES=(
+    audit bodyweight coach coach-plus messaging nutrition
+    payment social tracking user web-blog web-service-main web-ssr
+  )
+fi
 
 #############################################
 # UI helpers
@@ -146,20 +240,147 @@ open_url() {
   fi
 }
 
-# --- Ctrl-C handling: always bounce to menu ---
-WAS_INTERRUPTED=0
-on_sigint() {
-  WAS_INTERRUPTED=1
-  echo
-  log_msg "INFO" "User interrupted execution (Ctrl-C)"
-  warn "Interrupted. Returning to menu..."
+create_shell_backup() {
+  local shell_rc="${1:-}"
+
+  if [[ -z "$shell_rc" ]]; then
+    err "No shell configuration file provided for backup"
+    return 1
+  fi
+
+  if [[ ! -e "$shell_rc" ]]; then
+    warn "Shell configuration file $shell_rc not found. Creating it before backup."
+    if ! touch "$shell_rc"; then
+      err "Failed to create shell configuration file: $shell_rc"
+      return 1
+    fi
+  fi
+
+  local epoch
+  epoch="$(date +%s)"
+  local backup_file="${shell_rc}.backup.${epoch}"
+
+  if ! cp "$shell_rc" "$backup_file"; then
+    err "Failed to create backup of $shell_rc"
+    return 1
+  fi
+
+  log_msg "INFO" "Shell configuration backup created: $backup_file"
+  echo "$backup_file"
+  return 0
 }
+
+# List of background PIDs to clean up on exit
+CHILD_PIDS=()
+INTERRUPT_TIMESTAMP=0
+SCRIPT_EXITING=0
+cleanup_child_pids() {
+  if [[ "${#CHILD_PIDS[@]}" -gt 0 ]]; then
+    log_msg "INFO" "Cleaning up ${#CHILD_PIDS[@]} child processes..."
+    for pid in "${CHILD_PIDS[@]}"; do
+      if [[ "$pid" != "$MAIN_PID" ]] && kill -0 "$pid" 2>/dev/null; then
+        log_msg "DEBUG" "Terminating child process $pid"
+        if ! kill -15 "$pid" 2>/dev/null; then
+          kill -9 "$pid" 2>/dev/null || true
+        fi
+        wait "$pid" 2>/dev/null || true
+      fi
+    done
+    CHILD_PIDS=()
+  fi
+}
+trap 'cleanup_child_pids' EXIT
+
+
+# Handle interrupt (Ctrl+C) more robustly
+on_sigint() {
+  cleanup_child_pids
+  local current_time=$(date +%s)
+  
+  # Check if this is a rapid double-press (within 2 seconds)
+  if [[ $((current_time - INTERRUPT_TIMESTAMP)) -lt 2 ]]; then
+    INTERRUPT_COUNT=$((INTERRUPT_COUNT + 1))
+  else
+    INTERRUPT_COUNT=1
+  fi
+  
+  INTERRUPT_TIMESTAMP=$current_time
+  WAS_INTERRUPTED=1
+  FORCE_RETURN_TO_MENU=1  # Add this flag to force exit loops
+  echo
+  
+  # Different behavior based on how many times Ctrl+C was pressed
+  if [[ $INTERRUPT_COUNT -ge 3 ]]; then
+    log_msg "WARN" "User pressed Ctrl+C multiple times in rapid succession. Force exiting."
+    echo -e "\033[31mForce exiting script due to multiple interrupts\033[0m"
+    kill -9 $$ 2>/dev/null || exit 130  # Ensure we really exit
+  elif [[ $INTERRUPT_COUNT -ge 2 ]]; then
+    log_msg "INFO" "User pressed Ctrl+C twice. Offering exit option."
+    echo -e "\033[33mPress Ctrl+C again within 2 seconds to force exit the script\033[0m"
+    warn "Interrupted. Returning to menu..."
+  else
+    log_msg "INFO" "User interrupted execution (Ctrl+C)"
+    warn "Interrupted. Returning to menu..."
+  fi
+}
+
+# Emergency escape hatch - triggered if script appears hung
+on_usr1() {
+  log_msg "ERROR" "Emergency timeout triggered after inactivity"
+  echo -e "\n\033[31mEmergency timeout reached!\033[0m"
+  echo "The script appears to be unresponsive. Forcing return to main menu."
+  FORCE_RETURN_TO_MENU=1
+  WAS_INTERRUPTED=1
+  INTERRUPT_COUNT=0
+}
+
+# Set up signal handlers
 trap 'on_sigint' INT
+trap 'on_usr1' USR1
+
+# Setup safety timeout to handle potential hangs
+setup_safety_timeout() {
+  if [[ "$SCRIPT_EXITING" -eq 1 ]]; then return; fi
+  # Clean up any previous timeout
+  if [[ -n "${TIMEOUT_PID:-}" ]] && kill -0 $TIMEOUT_PID 2>/dev/null; then
+    kill $TIMEOUT_PID 2>/dev/null || true
+    wait $TIMEOUT_PID 2>/dev/null || true
+  fi
+  
+  # Start a new timeout monitor (sends USR1 after 5 minutes)
+  (
+    sleep 300  # 5 minutes
+    if [[ -n "${MAIN_PID:-}" ]]; then
+      kill -USR1 "$MAIN_PID" 2>/dev/null || true
+    fi
+  ) &
+  TIMEOUT_PID=$!
+  CHILD_PIDS+=("$TIMEOUT_PID")
+  log_msg "DEBUG" "Safety timeout set for 5 minutes (PID: $TIMEOUT_PID)"
+}
+
+cleanup_safety_timeout() {
+  if [[ "${BASHPID:-$$}" != "${MAIN_PID:-$$}" ]]; then
+    return
+  fi
+
+  if [[ -n "${TIMEOUT_PID:-}" ]]; then
+    if kill -0 "$TIMEOUT_PID" 2>/dev/null; then
+      kill "$TIMEOUT_PID" 2>/dev/null || true
+      wait "$TIMEOUT_PID" 2>/dev/null || true
+    fi
+    unset TIMEOUT_PID
+  fi
+}
 
 pause() {
-  if [[ "${WAS_INTERRUPTED:-0}" -eq 1 ]]; then
+  # Reset interrupt counter during normal operation
+  INTERRUPT_COUNT=0
+  
+  if [[ "${WAS_INTERRUPTED:-0}" -eq 1 || "${FORCE_RETURN_TO_MENU:-0}" -eq 1 ]]; then
     WAS_INTERRUPTED=0
-    log_msg "DEBUG" "Pause skipped due to previous interruption"
+    FORCE_RETURN_TO_MENU=0
+    log_msg "DEBUG" "Pause skipped due to previous interruption or force return"
     return
   fi
   log_msg "DEBUG" "Pausing for user input"
@@ -168,18 +389,80 @@ pause() {
 }
 
 # Wrap long-running commands so Ctrl-C is "expected"
-run_blocking() {
-  log_msg "INFO" "Running command: $*"
-  set +e
-  "$@" 2> >(tee -a "$LOG_FILE" >&2)
+  run_blocking() {
+    log_msg "INFO" "Running command: $*"
+    
+    # Reset interrupt counter before command execution
+    INTERRUPT_COUNT=0
+    FORCE_RETURN_TO_MENU=0
+    
+    # Setup safety timeout that will send USR1 signal if command hangs
+    setup_safety_timeout
+    
+    # Run the command in the background
+    "$@" &
+    local cmd_pid=$!
+    CHILD_PIDS+=("$cmd_pid")
+
+    # Wait for the command to finish, but allow Ctrl+C to interrupt
+    wait "$cmd_pid"
+    local status=$?
+    
+    # Remove the PID from the cleanup list
+    for i in "${!CHILD_PIDS[@]}"; do
+      if [[ "${CHILD_PIDS[$i]}" == "$cmd_pid" ]]; then
+        unset 'CHILD_PIDS[$i]'
+        break
+      fi
+    done
+
+    # Clean up the safety timeout
+    cleanup_safety_timeout
+    
+    # Handle special cases
+    if [[ $status -eq 130 ]]; then
+      WAS_INTERRUPTED=1
+      FORCE_RETURN_TO_MENU=1
+      log_msg "INFO" "Command was interrupted by user (SIGINT)"
+    elif [[ $status -ne 0 ]]; then
+      log_msg "WARN" "Command completed with non-zero status: $status"
+    else
+      log_msg "INFO" "Command completed successfully"
+    fi
+    return $status
+}
+
+# Wrap interactive commands that need a TTY
+run_interactive() {
+  log_msg "INFO" "Running interactive command: $*"
+  
+  # Reset interrupt counter before command execution
+  INTERRUPT_COUNT=0
+  FORCE_RETURN_TO_MENU=0
+  
+  # Setup safety timeout that will send USR1 signal if command hangs
+  setup_safety_timeout
+  
+  # Just run the command directly. The TTY is inherited.
+  # The main script's INT trap will handle Ctrl+C and return to the menu.
+  "$@"
   local status=$?
-  set -e
-  log_msg "INFO" "Command completed with status: $status"
-  [[ $status -eq 130 ]] && {
+
+  # Clean up the safety timeout
+  cleanup_safety_timeout
+
+  if [[ $status -eq 130 ]]; then
     WAS_INTERRUPTED=1
-    log_msg "INFO" "Command was interrupted by user"
-  }
-  return $status
+    FORCE_RETURN_TO_MENU=1
+    log_msg "INFO" "Command was interrupted by user (SIGINT)"
+  elif [[ $status -ne 0 ]]; then
+    # Don't log an error for common exit codes from shells
+    if [[ $status -ne 1 && $status -ne 127 ]]; then
+        log_msg "WARN" "Command completed with non-zero status: $status"
+    fi
+  else
+    log_msg "INFO" "Command completed successfully"
+  fi
 }
 
 #############################################
@@ -334,12 +617,54 @@ ensure_totp_present_flow() {
   echo "  Account → Security / Multi-factor Authentication → Add TOTP"
   echo
   open_url "$dash"
-  read -r -p "When you've added a TOTP device, press ENTER to re-check..." _
+  
+  # Setup timeout for this operation
+  setup_safety_timeout
+  
+  # Clear any previous interrupts
+  WAS_INTERRUPTED=0
+  FORCE_RETURN_TO_MENU=0
+  
+  read -r -p "When you've added a TOTP device, press ENTER to re-check (or Ctrl+C to return to menu)..." _
+
+  # Check if user interrupted before continuing
+  if [[ "$FORCE_RETURN_TO_MENU" -eq 1 || "$WAS_INTERRUPTED" -eq 1 ]]; then
+    warn "Operation cancelled. Returning to menu."
+    return 1
+  fi
 
   if ! has_totp_device; then
     err "Still no TOTP detected. Please finish adding TOTP in the dashboard."
-    read -r -p "Press ENTER to check again (or Ctrl-C to abort)..." _
-    has_totp_device || { err "No TOTP device found. Aborting."; return 1; }
+    
+    # Allow limited retries before forcing return
+    local retries=0
+    while [[ $retries -lt 3 && "$FORCE_RETURN_TO_MENU" -eq 0 ]]; do
+      read -r -p "Press ENTER to check again (or Ctrl-C to abort)..." _
+      
+      # Check for interruption
+      if [[ "$FORCE_RETURN_TO_MENU" -eq 1 || "$WAS_INTERRUPTED" -eq 1 ]]; then
+        warn "Operation cancelled. Returning to menu."
+        return 1
+      fi
+      
+      if has_totp_device; then
+        break
+      fi
+      
+      retries=$((retries + 1))
+      if [[ $retries -eq 3 ]]; then
+        err "Maximum retries reached. Returning to menu."
+        return 1
+      fi
+      
+      err "Still no TOTP detected. Please complete the setup in the dashboard."
+    done
+    
+    # Final check
+    if ! has_totp_device; then
+      err "No TOTP device found. Aborting."
+      return 1
+    fi
   fi
 
   bold "TOTP detected. Proceeding…"
@@ -375,7 +700,11 @@ add_touchid_or_webauthn_flow() {
 }
 
 ensure_db_mfa_requirements() {
-  ensure_logged_in || return 1
+  # Check if logged in
+  if ! ensure_logged_in; then
+    echo "You need to log in to Teleport first. Please select 'Login to Teleport' from the main menu."
+    return 1
+  fi
   ensure_totp_present_flow || return 1
   add_touchid_or_webauthn_flow || return 1
   return 0
@@ -389,8 +718,10 @@ ensure_logged_in() {
   local st
   st="$(tsh status 2>/dev/null || true)"
   if ! grep -q "Proxy: .*${PROXY_HOST}:${PROXY_PORT}" <<<"$st"; then
-    warn "Not logged in to ${PROXY_HOST}:${PROXY_PORT}. Launching login…"
-    tsh_login || return 1
+    warn "Not logged in to ${PROXY_HOST}:${PROXY_PORT}."
+    # Don't auto-login, let user choose from menu instead
+    # tsh_login || return 1
+    return 1
   fi
   return 0
 }
@@ -399,6 +730,19 @@ ensure_logged_in() {
 # Teleport actions
 #############################################
 tsh_login() {
+  # Check if we're already logged in
+  if tsh status >/dev/null 2>&1; then
+    local already_logged_in=1
+    log_msg "INFO" "Already logged in to Teleport"
+    if [[ "${1:-}" != "--force" ]]; then
+      echo "You are already logged into Teleport."
+      read -r -p "Log in again? [y/N]: " ans || true
+      if [[ "${ans:-}" != "y" && "${ans:-}" != "Y" ]]; then
+        return 0
+      fi
+    fi
+  fi
+
   parse_proxy
   bold "Checking reachability of Teleport proxy: ${PROXY_HOST}:${PROXY_PORT} ..."
   if ! proxy_reachable; then
@@ -448,12 +792,13 @@ proxy_db() {
   local tunnel="$1"      # Teleport DB resource name
   local dbname="$2"      # SQL database name
   local default_port="${3:-5432}"
+  local default_user="${4:-root}"  # Default user (root-teleport for integration, root for production)
 
   # Enforce MFA prerequisites before DB
   ensure_db_mfa_requirements || return 0
 
   local dbuser port
-  dbuser="$(prompt_db_user "root")"
+  dbuser="$(prompt_db_user "$default_user")"
   port="$(prompt_port "$default_port")"
 
   bold "Preparing DB session (MFA may prompt)…"
@@ -469,8 +814,9 @@ proxy_db() {
   echo
   run_blocking tsh proxy db --tunnel "${tunnel}" --port "${port}" || true
 
-  if [[ "${WAS_INTERRUPTED:-0}" -eq 1 ]]; then
+  if [[ "${WAS_INTERRUPTED:-0}" -eq 1 || "${FORCE_RETURN_TO_MENU:-0}" -eq 1 ]]; then
     WAS_INTERRUPTED=0
+    FORCE_RETURN_TO_MENU=0
     return
   fi
 
@@ -516,12 +862,49 @@ need_jq() {
 
 kube_login() {
   local cluster="$1"
+  
+  # Check if we're already logged into this cluster
+  local existing_ctx="$(context_for_cluster "$cluster")"
+  if [[ -n "$existing_ctx" ]]; then
+    log_msg "INFO" "Context for $cluster already exists: $existing_ctx"
+    
+    # Check if the context is still listed in tsh kube ls
+    if tsh kube ls 2>/dev/null | grep -q "$cluster"; then
+      log_msg "INFO" "Cluster $cluster is already accessible via Teleport"
+      return 0
+    else
+      log_msg "INFO" "Context exists but cluster not in tsh kube ls, re-logging into $cluster"
+    fi
+  fi
+  
   bold "tsh kube login ${cluster}"
   run_blocking tsh kube login "${cluster}" || true
 }
 
 choose_env() {
-  printf "integration\nproduction\n" | fzf --prompt="Environment > " --height=10 --border || true
+  log_msg "DEBUG" "Prompting user to choose environment"
+  
+  # Use a temporary file to capture fzf selection without UI noise
+  local tmp_file=$(mktemp)
+  # Using process substitution to avoid fzf UI noise in logs
+  printf "integration\nproduction\n" | fzf --prompt="Environment > " --height=10 --border > "$tmp_file"
+  local fzf_status=$?
+  local env=""
+  if [[ -s "$tmp_file" ]]; then
+    env=$(cat "$tmp_file")
+  fi
+  rm -f "$tmp_file"
+  
+  log_msg "DEBUG" "Environment picker exit status: $fzf_status, result: '${env}'"
+
+  if [[ $fzf_status -ne 0 || -z "$env" ]]; then
+    log_msg "INFO" "Environment selection canceled"
+    env=""
+  else
+    log_msg "INFO" "User selected environment: $env"
+  fi
+  
+  echo "$env"
 }
 
 context_for_cluster() {
@@ -530,7 +913,70 @@ context_for_cluster() {
 }
 
 choose_namespace() {
-  printf "%s\n" "${KUBE_NAMESPACES[@]}" | fzf --prompt="Namespace > " --height=20 --border || true
+  local ctx="${1:-}"
+  local cluster="${2:-unknown}"
+  local env="${3:-unknown}"
+
+  log_msg "DEBUG" "Prompting user to choose namespace (env=$env, cluster=$cluster, ctx=${ctx:-current})"
+
+  # Build candidate list from configured namespaces first
+  local candidates=()
+  if [[ "${#KUBE_NAMESPACES[@]}" -gt 0 ]]; then
+    for ns in "${KUBE_NAMESPACES[@]}"; do
+      if [[ -n "${ns// }" ]]; then
+        candidates+=("$ns")
+      fi
+    done
+  fi
+
+  # Augment with namespaces discovered via kubectl (if available)
+  local discovered=""
+  discovered=$(kubectl ${ctx:+--context "$ctx"} get namespaces --no-headers -o custom-columns=":metadata.name" 2>/dev/null || true)
+  if [[ -n "$discovered" ]]; then
+    while IFS= read -r ns; do
+      [[ -z "${ns// }" ]] && continue
+      local exists=0
+      for existing in "${candidates[@]}"; do
+        if [[ "$existing" == "$ns" ]]; then
+          exists=1
+          break
+        fi
+      done
+      if [[ $exists -eq 0 ]]; then
+        candidates+=("$ns")
+      fi
+    done <<< "$discovered"
+  fi
+
+  log_msg "DEBUG" "Namespace candidate count: ${#candidates[@]}"
+
+  if [[ ${#candidates[@]} -eq 0 ]]; then
+    err "No namespaces available. Please verify your Kubernetes access."
+    pause
+    echo ""
+    return
+  fi
+
+  # Use a temporary file to capture fzf selection without UI noise
+  local tmp_file=$(mktemp)
+  printf "%s\n" "${candidates[@]}" | fzf --prompt="Namespace > " --height=20 --border > "$tmp_file"
+  local fzf_status=$?
+  local ns=""
+  if [[ -s "$tmp_file" ]]; then
+    ns=$(cat "$tmp_file")
+  fi
+  rm -f "$tmp_file"
+  
+  log_msg "DEBUG" "Namespace picker exit status: $fzf_status, result: '${ns}'"
+
+  if [[ $fzf_status -ne 0 || -z "$ns" ]]; then
+    log_msg "INFO" "Namespace selection canceled"
+    ns=""
+  else
+    log_msg "INFO" "User selected namespace: $ns"
+  fi
+  
+  echo "$ns"
 }
 
 list_pods_in_namespace() {
@@ -540,17 +986,30 @@ list_pods_in_namespace() {
     awk '{print $1}'
 }
 
-# Return only pods suitable for exec: Running + has 'rails' container
+# Return only pods suitable for exec: Running + has container matching DEFAULT_CONTAINER
 list_exec_pods_in_namespace() {
   local ctx="$1" ns="$2"
   need_jq || return 1
   
+  log_msg "DEBUG" "Listing executable pods in namespace $ns with container '$DEFAULT_CONTAINER'"
+  
   # Get pods with status and container info in one command for better performance
-  kubectl ${ctx:+--context "$ctx"} -n "$ns" get pods -o json 2>/dev/null | 
-    jq -r '.items[] | 
+  local pod_list
+  pod_list=$(kubectl ${ctx:+--context "$ctx"} -n "$ns" get pods -o json 2>/dev/null | 
+    jq -r --arg container "$DEFAULT_CONTAINER" '.items[] | 
            select(.status.phase=="Running") | 
-           select(.spec.containers[].name=="rails") | 
-           .metadata.name'
+           select(.spec.containers[].name==$container) | 
+           .metadata.name')
+           
+  # Log the available pods to make debugging easier
+  local pod_count=$(echo "$pod_list" | wc -l | tr -d ' ')
+  if [[ "$pod_count" -gt 0 && -n "$pod_list" ]]; then
+    log_msg "DEBUG" "Found $pod_count pods with container '$DEFAULT_CONTAINER' in namespace $ns"
+  else
+    log_msg "WARN" "No pods with container '$DEFAULT_CONTAINER' found in namespace $ns"
+  fi
+  
+  echo "$pod_list"
 }
 
 #############################################
@@ -569,36 +1028,69 @@ kube_logs_flow() {
     cluster="$KUBE_CLUSTER_PRODUCTION"
   fi
 
-  kube_login "$cluster"
-  ctx="$(context_for_cluster "$cluster")"
-  [[ -z "$ctx" ]] && warn "Could not detect a matching kubectl context. Using current context."
+  log_msg "INFO" "Preparing logs flow for env=$env (cluster=$cluster)"
+  bold "Preparing access to cluster $cluster ($env)..."
 
-  ns="$(choose_namespace)"
+  # Check if already logged into the cluster, if not, log in
+  ctx="$(context_for_cluster "$cluster")"
+  if [[ -z "$ctx" ]]; then
+    log_msg "INFO" "Not logged into $cluster, attempting login..."
+    bold "Logging into Teleport Kubernetes cluster $cluster..."
+    kube_login "$cluster"
+    ctx="$(context_for_cluster "$cluster")"
+    [[ -z "$ctx" ]] && warn "Could not detect a matching kubectl context. Using current context."
+  else
+    log_msg "INFO" "Using existing kubectl context for $cluster: $ctx"
+  fi
+
+  log_msg "INFO" "Prompting for namespace selection"
+  bold "Select a namespace to tail logs from:"
+  ns="$(choose_namespace "${ctx:-}" "$cluster" "$env")"
+  log_msg "INFO" "Namespace selection result: '${ns}'"
   [[ -z "${ns:-}" ]] && return 0
 
-  bold "Fetching pods with rails container..."
-  # Get pods with rails container in one call for better performance
-  pod="$(kubectl ${ctx:+--context "$ctx"} -n "$ns" get pods -o custom-columns="NAME:.metadata.name,STATUS:.status.phase,CONTAINERS:.spec.containers[*].name" --no-headers 2>/dev/null |
-         grep -i "rails" | awk '{print $1}' | fzf --prompt="Pod in $ns > " --height=25 --border)"
-  [[ -z "${pod:-}" ]] && return 0
+  bold "Fetching pods with ${DEFAULT_CONTAINER} container..."
+  log_msg "DEBUG" "Listing pods with ${DEFAULT_CONTAINER} container in namespace $ns"
+  
+  # Get pods with container in one call for better performance
+  local pod_list
+  pod_list=$(timeout 15 kubectl ${ctx:+--context "$ctx"} -n "$ns" get pods -o custom-columns="NAME:.metadata.name,STATUS:.status.phase,CONTAINERS:.spec.containers[*].name" --no-headers |
+         grep -i "${DEFAULT_CONTAINER}" | awk '{print $1}')  # Log the number of pods found
+  local pod_count=$(echo "$pod_list" | wc -l | tr -d ' ')
+  log_msg "DEBUG" "Found $pod_count pods with ${DEFAULT_CONTAINER} container in namespace $ns"
+  
+  # Use temporary file to avoid fzf UI in logs
+  local tmp_file=$(mktemp)
+  echo "$pod_list" | fzf --prompt="Pod in $ns > " --height=25 --border > "$tmp_file"
+  
+  pod=$(cat "$tmp_file")
+  rm -f "$tmp_file"
+  
+  if [[ -n "$pod" ]]; then
+    log_msg "INFO" "Selected pod: $pod"
+  else
+    log_msg "INFO" "Pod selection canceled"
+    return 0
+  fi
 
   # Check container with direct access to avoid additional kubectl calls
   container_list=$(kubectl ${ctx:+--context "$ctx"} -n "$ns" get pod "$pod" -o jsonpath="{.spec.containers[*].name}" 2>/dev/null)
   debug "Available containers in pod: $container_list"
   
-  if ! echo "$container_list" | grep -qE '(^|,| )rails($|,| )'; then
-    err "Container 'rails' not found in $pod. Aborting logs."
+  if ! echo "$container_list" | grep -qE "(^|,| )${DEFAULT_CONTAINER}($|,| )"; then
+    err "Container '${DEFAULT_CONTAINER}' not found in $pod. Aborting logs."
     debug "Containers in pod are: $container_list"
     pause
     return 0
   fi
 
-  bold "Streaming logs for container 'rails' from ${pod} (ns=${ns})..."
+  bold "Streaming logs for container '${DEFAULT_CONTAINER}' from ${pod} (ns=${ns})..."
   warn "Press CTRL-C to stop and return to the menu."
-  run_blocking kubectl ${ctx:+--context "$ctx"} -n "$ns" logs -f "$pod" -c rails || true
+  run_blocking kubectl ${ctx:+--context "$ctx"} -n "$ns" logs -f "$pod" -c "$DEFAULT_CONTAINER"
 
-  if [[ "${WAS_INTERRUPTED:-0}" -eq 1 ]]; then
+  if [[ "${WAS_INTERRUPTED:-0}" -eq 1 || "${FORCE_RETURN_TO_MENU:-0}" -eq 1 ]]; then
     WAS_INTERRUPTED=0
+    FORCE_RETURN_TO_MENU=0
     return
   fi
   pause
@@ -617,36 +1109,160 @@ kube_exec_flow() {
     cluster="$KUBE_CLUSTER_PRODUCTION"
   fi
 
-  kube_login "$cluster"
+  # Check if already logged into the cluster, if not, log in
   ctx="$(context_for_cluster "$cluster")"
-  [[ -z "$ctx" ]] && warn "Could not detect a matching kubectl context. Using current context."
+  if [[ -z "$ctx" ]]; then
+    log_msg "INFO" "Not logged into $cluster, attempting login..."
+    kube_login "$cluster"
+    ctx="$(context_for_cluster "$cluster")"
+    [[ -z "$ctx" ]] && warn "Could not detect a matching kubectl context. Using current context."
+  else
+    log_msg "DEBUG" "Already have context for $cluster: $ctx"
+  fi
 
-  ns="$(choose_namespace)"
+  ns="$(choose_namespace "${ctx:-}" "$cluster" "$env")"
   [[ -z "${ns:-}" ]] && return 0
 
-  pod="$(list_exec_pods_in_namespace "${ctx:-}" "$ns" | fzf --prompt="Pod in $ns (exec) > " --height=25 --border || true)"
-  [[ -z "${pod:-}" ]] && return 0
+  # Get list of exec-ready pods and filter through fzf, avoiding UI noise in logs
+  local pod_list=$(list_exec_pods_in_namespace "${ctx:-}" "$ns")
+  
+  # Use temporary file to avoid fzf UI in logs
+  local tmp_file=$(mktemp)
+  echo "$pod_list" | fzf --prompt="Pod in $ns (exec) > " --height=25 --border > "$tmp_file"
+  
+  pod=$(cat "$tmp_file")
+  rm -f "$tmp_file"
+  
+  if [[ -n "$pod" ]]; then
+    log_msg "INFO" "Selected pod for exec: $pod"
+  else
+    log_msg "INFO" "Pod exec selection canceled"
+    return 0
+  fi
 
   # Double-check the container exists (better safe than sorry)
   container_list=$(kubectl ${ctx:+--context "$ctx"} -n "$ns" get pod "$pod" -o jsonpath="{.spec.containers[*].name}" 2>/dev/null)
   debug "Available containers in pod: $container_list"
   
-  if ! echo "$container_list" | grep -qE '(^|,| )rails($|,| )'; then
-    err "Container 'rails' not found in $pod. Aborting exec."
+  if ! echo "$container_list" | grep -qE "(^|,| )${DEFAULT_CONTAINER}($|,| )"; then
+    err "Container '${DEFAULT_CONTAINER}' not found in $pod. Aborting exec."
     debug "Containers in pod are: $container_list"
     pause
     return 0
   fi
 
-  bold "Exec into $pod (ns=$ns) container 'rails' using /bin/bash"
+  bold "Exec into $pod (ns=$ns) container '${DEFAULT_CONTAINER}' using /bin/bash"
   warn "Inside the remote shell, use 'exit' or Ctrl-D to return to the menu."
 
-  run_blocking kubectl ${ctx:+--context "$ctx"} exec -it "$pod" -n "$ns" -c rails -- /bin/bash || true
+  run_interactive kubectl ${ctx:+--context "$ctx"} exec -it "$pod" -n "$ns" -c "$DEFAULT_CONTAINER" -- /bin/bash || true
 
-  if [[ "${WAS_INTERRUPTED:-0}" -eq 1 ]]; then
+  if [[ "${WAS_INTERRUPTED:-0}" -eq 1 || "${FORCE_RETURN_TO_MENU:-0}" -eq 1 ]]; then
     WAS_INTERRUPTED=0
+    FORCE_RETURN_TO_MENU=0
     return
   fi
+  pause
+}
+
+#############################################
+# Kubernetes context switching
+#############################################
+install_kcx() {
+  need_kubectl || return 1
+  
+  local rc_file=""
+  if [[ "$SHELL" == */zsh ]]; then
+    rc_file="${HOME}/.zshrc"
+  elif [[ "$SHELL" == */bash ]]; then
+    if [[ -f "${HOME}/.bashrc" ]]; then
+      rc_file="${HOME}/.bashrc"
+    elif [[ -f "${HOME}/.bash_profile" ]]; then
+      rc_file="${HOME}/.bash_profile"
+    else
+      rc_file="${HOME}/.bashrc"
+    fi
+  else
+    warn "Unsupported shell: $SHELL"
+    echo "Only bash and zsh are currently supported for shortcuts."
+    return 1
+  fi
+  
+  if [[ -f "$rc_file" ]] && grep -q "function kcx()" "$rc_file" 2>/dev/null; then
+    info "kcx function is already installed in $rc_file"
+    return 0
+  fi
+
+  local backup_file
+  if ! backup_file=$(create_shell_backup "$rc_file"); then
+    err "Failed to create backup of $rc_file. Aborting installation."
+    return 1
+  fi
+  bold "Created backup: $backup_file"
+  
+  bold "Installing kcx function for easy context switching between clusters..."
+  
+  # Create the kcx function tailored for our environment using the current cluster variables
+  cat >> "$rc_file" << EOF
+
+# kcx - Fast kubernetes context switcher for Freeletics clusters
+function kcx() {
+  local INTEGRATION_CLUSTER="${KUBE_CLUSTER_INTEGRATION}"
+  local PRODUCTION_CLUSTER="${KUBE_CLUSTER_PRODUCTION}"
+  
+  case "\$1" in
+    i|int|integration)
+      echo "Switching to integration cluster context..."
+      kubectl config use-context "\$(kubectl config get-contexts -o name | grep -i "\$INTEGRATION_CLUSTER" | head -n1)"
+      ;;
+    p|prod|production)
+      echo "Switching to production cluster context..."
+      kubectl config use-context "\$(kubectl config get-contexts -o name | grep -i "\$PRODUCTION_CLUSTER" | head -n1)"
+      ;;
+    *)
+      echo "Usage: kcx [i|int|integration|p|prod|production]"
+      echo ""
+      echo "Current contexts:"
+      kubectl config get-contexts
+      ;;
+  esac
+}
+EOF
+
+  success "kcx function installed! Please restart your terminal or run 'source $rc_file' to use it."
+  info "Usage examples:"
+  echo "  kcx i          # Switch to integration cluster"
+  echo "  kcx p          # Switch to production cluster"
+  echo "  kcx            # Show available contexts and usage info"
+  
+  return 0
+}
+
+switch_kube_context() {
+  need_kubectl || return 0
+  
+  local env
+  env="$(choose_env)"
+  [[ -z "${env:-}" ]] && return 0
+  
+  if [[ "$env" == "integration" ]]; then
+    cluster="$KUBE_CLUSTER_INTEGRATION"
+  else
+    cluster="$KUBE_CLUSTER_PRODUCTION"
+  fi
+  
+  kube_login "$cluster"
+  ctx="$(context_for_cluster "$cluster")"
+  
+  if [[ -n "$ctx" ]]; then
+    bold "Switching kubectl context to: $ctx"
+    kubectl config use-context "$ctx"
+    success "Context switched to $ctx"
+  else
+    err "Could not find a context matching cluster $cluster"
+    info "Available contexts:"
+    kubectl config get-contexts
+  fi
+  
   pause
 }
 
@@ -956,44 +1572,103 @@ system_check() {
   echo
 }
 
+setup_vpn_resources() {
+  local vpn_endpoint_url="https://self-service.clientvpn.amazonaws.com/endpoints/cvpn-endpoint-0047b5d8713877b13"
+  local vpn_docs_url="https://freeletics.atlassian.net/wiki/spaces/IT/pages/4272685065/AWS+VPNs"
+
+  bold "AWS Client VPN setup"
+  echo "Opening the AWS Client VPN self-service portal in your browser..."
+  open_url "$vpn_endpoint_url"
+  echo
+  echo "From the portal:" 
+  echo "  • Download your VPN configuration profile (OVPN file)."
+  echo "  • Download and install the AWS VPN Client application if it's not already installed."
+  echo
+  echo "For step-by-step guidance, see the internal documentation:"
+  echo "  $vpn_docs_url"
+  echo
+  pause
+}
+
 #############################################
 # Main menu
 #############################################
 main_menu() {
-  while :; do
+  while [[ "$FORCE_RETURN_TO_MENU" -eq 0 ]]; do
+    # Reset interrupt flags before processing each menu choice
+    WAS_INTERRUPTED=0
+    log_msg "DEBUG" "Showing main menu"
+    
+    # Check if fzf is installed and available in PATH
+    if ! command -v fzf >/dev/null 2>&1; then
+      log_msg "ERROR" "fzf is not installed or not found in PATH"
+      echo -e "\033[31mError: fzf is not installed or not found in PATH\033[0m"
+      echo "Installing fzf..."
+      install_fzf || { 
+        echo "Could not install fzf. Menu cannot be displayed.";
+        echo "Please install fzf manually and restart the script.";
+        exit 1;
+      }
+    fi
+    
+    # Construct menu options
+    local options=(
+      "Login to Teleport (tsh login)"
+      "DB: Proxy Integration (${DB_TUNNEL_INTEGRATION} → ${DB_NAME_INTEGRATION})"
+      "DB: Proxy Production (${DB_TUNNEL_PRODUCTION} → ${DB_NAME_PRODUCTION})"
+      "K8s: Login Integration (${KUBE_CLUSTER_INTEGRATION})"
+      "K8s: Login Production (${KUBE_CLUSTER_PRODUCTION})"
+      "K8s: Switch Context (quickly change between clusters)"
+      "K8s: Install 'kcx' Command (for fast context switching)"
+      "K8s: Logs (env → ns → pod '${DEFAULT_CONTAINER}')"
+      "K8s: Exec (env → ns → pod '${DEFAULT_CONTAINER}')"
+      "System Check (connectivity, access, MFA status)"
+  "Setup AWS VPN (download config & client)"
+      "Install Shell Shortcuts (k alias, tp login/logout, kns)"
+      "Check for Updates"
+      "Report a Bug"
+      "Teleport Logout"
+      "Quit"
+    )
+    
+    # Use a pipe and `read` to get the choice from fzf robustly.
     local choice
-    choice="$(
-      printf "%s\n" \
-        "Login to Teleport (tsh login)" \
-        "DB: Proxy Integration (${DB_TUNNEL_INTEGRATION} → ${DB_NAME_INTEGRATION})" \
-        "DB: Proxy Production (${DB_TUNNEL_PRODUCTION} → ${DB_NAME_PRODUCTION})" \
-        "K8s: Login Integration (${KUBE_CLUSTER_INTEGRATION})" \
-        "K8s: Login Production (${KUBE_CLUSTER_PRODUCTION})" \
-        "K8s: Logs (env → ns → pod 'rails')" \
-        "K8s: Exec (env → ns → pod 'rails')" \
-        "System Check (connectivity, access, MFA status)" \
-        "Install Shell Shortcuts (k alias, tp login/logout, kns)" \
-        "Check for Updates" \
-        "Report a Bug" \
-        "Teleport Logout" \
-        "Quit" \
-      | fzf --prompt="Teleport Helper > " --height=20 --border
-    )" || true
+    choice=$(printf "%s\n" "${options[@]}" | fzf --prompt="Teleport Helper > " --height=20 --border)
+    local fzf_exit_code=$?
+
+    if [[ $fzf_exit_code -ne 0 ]]; then
+        log_msg "INFO" "Menu selection canceled or fzf failed (exit code: $fzf_exit_code)"
+        # If fzf was cancelled (e.g. Ctrl-C, Esc), treat it like a Quit.
+        if [[ $fzf_exit_code -eq 130 || $fzf_exit_code -eq 1 ]]; then
+            choice="Quit"
+        else
+            choice="" # Other error, redisplay menu
+        fi
+    elif [[ -n "$choice" ]]; then
+        log_msg "INFO" "User selected menu option: $choice"
+    else
+        log_msg "INFO" "Menu selection was empty"
+    fi
 
     case "${choice:-}" in
       "Login to Teleport (tsh login)") tsh_login ;;
-      "DB: Proxy Integration"*) proxy_db "$DB_TUNNEL_INTEGRATION" "$DB_NAME_INTEGRATION" "5432" ;;
-      "DB: Proxy Production"*)  proxy_db "$DB_TUNNEL_PRODUCTION"   "$DB_NAME_PRODUCTION"   "5432" ;;
+      "DB: Proxy Integration"*) proxy_db "$DB_TUNNEL_INTEGRATION" "$DB_NAME_INTEGRATION" "$DB_PORT" "$DB_USER_INTEGRATION" ;;
+      "DB: Proxy Production"*)  proxy_db "$DB_TUNNEL_PRODUCTION"   "$DB_NAME_PRODUCTION"   "$DB_PORT" "$DB_USER_PRODUCTION" ;;
       "K8s: Login Integration"*) kube_login "$KUBE_CLUSTER_INTEGRATION"; pause ;;
       "K8s: Login Production"*)  kube_login "$KUBE_CLUSTER_PRODUCTION"; pause ;;
+      "K8s: Switch Context"*)    switch_kube_context ;;
+      "K8s: Install 'kcx'"*)     install_kcx; pause ;;
       "K8s: Logs"*)              kube_logs_flow ;;
       "K8s: Exec"*)              kube_exec_flow ;;
       "System Check"*)          system_check; pause ;;
+  "Setup AWS VPN"*)         setup_vpn_resources ;;
       "Install Shell Shortcuts"*) install_shell_shortcuts ;;
       "Check for Updates")       check_and_update_script ;;
       "Report a Bug")            create_bug_report ;;
       "Teleport Logout")         tsh_logout ;;
-      "Quit")                    break ;;
+      "Quit")
+        break
+        ;;
       "" )                       ;;   # cancelled -> redisplay menu
       * )                        ;;   # unknown -> redisplay menu
     esac
@@ -1029,10 +1704,12 @@ install_shell_shortcuts() {
     return 1
   fi
   
-  if [[ ! -f "$shell_rc" ]]; then
-    err "Shell configuration file not found: $shell_rc"
+  local backup_file
+  if ! backup_file=$(create_shell_backup "$shell_rc"); then
+    err "Failed to create backup of $shell_rc. Aborting for safety."
     return 1
   fi
+  bold "Created backup: $backup_file"
   
   # Check for existing shortcuts section
   local has_existing_shortcuts=0
@@ -1081,9 +1758,9 @@ install_shell_shortcuts() {
   if [[ "$has_existing_shortcuts" -eq 1 ]]; then
     local temp_file
     temp_file=$(mktemp)
-    grep -v -F -f <(sed -n '/# Teleport shortcuts added on/,/# End of Teleport shortcuts/p' "$shell_rc") "$shell_rc" > "$temp_file"
-    cat "$temp_file" > "$shell_rc"
-    rm "$temp_file"
+    # Use sed to safely remove only the Teleport shortcuts section
+    sed '/# Teleport shortcuts added on/,/# End of Teleport shortcuts/d' "$shell_rc" > "$temp_file"
+    mv "$temp_file" "$shell_rc"
   fi
 
   # Create the shortcuts section if any shortcuts are requested
@@ -1162,8 +1839,7 @@ tp() {
   esac
 }"
       
-      # Write to config file
-      echo "$tp_function" >> "$shell_rc"
+      # Write to config file      echo "$tp_function" >> "$shell_rc"
       
       # Apply to current session
       eval "$tp_function"
@@ -1604,6 +2280,15 @@ if [[ $# -gt 0 ]]; then
     echo "  help             - Show this help message"
     echo ""
     echo "Without arguments, shows interactive menu."
+    echo ""
+    echo "Environment variables for customization:"
+    echo "  DEFAULT_CONTAINER=app         - Use 'app' container instead of 'rails'"
+    echo "  DB_PORT=5433                  - Use port 5433 for database connections" 
+    echo "  DB_USER_INTEGRATION=myuser    - Set integration database user (default: root-teleport)"
+    echo "  DB_USER_PRODUCTION=myuser     - Set production database user (default: root)"
+    echo "  KUBE_NAMESPACES_LIST=\"ns1 ns2\" - Custom list of namespaces to display"
+    echo ""
+    echo "Example: DEFAULT_CONTAINER=app DB_USER_INTEGRATION=admin bash $(basename "$0")"
     exit 0
   elif [[ "$1" == "--system-check" ]]; then
     system_check
@@ -1615,13 +2300,48 @@ if [[ $# -gt 0 ]]; then
   process_args "$@"
 fi
 
+# Initialize global variables for interrupt handling
+FORCE_RETURN_TO_MENU=0
+TIMEOUT_PID=""
+
 # Set up exit logging
 log_exit() {
-  log_msg "INFO" "Script exiting with status code $?"
+  local exit_status=${1:-$?}
+  SCRIPT_EXITING=1
+
+  cleanup_safety_timeout
+  cleanup_child_pids
+
+  log_msg "INFO" "Script exiting with status code $exit_status"
   log_msg "INFO" "Total execution time: $SECONDS seconds"
   log_msg "INFO" "==== End of session ===="
 }
-trap log_exit EXIT
+trap 'log_exit "$?"' EXIT
+
+# Setup the initial safety timeout
+setup_safety_timeout
+
+# Show current configuration on first run
+if [[ -z "${CONFIG_SHOWN:-}" ]]; then
+  echo -e "\033[1;36mCurrent configuration:\033[0m"
+  echo -e "  \033[33mDefault container:\033[0m ${DEFAULT_CONTAINER}"
+  echo -e "  \033[33mClusters:\033[0m ${KUBE_CLUSTER_INTEGRATION} (int), ${KUBE_CLUSTER_PRODUCTION} (prod)"
+  echo -e "  \033[33mDB Connections:\033[0m ${DB_TUNNEL_INTEGRATION}:${DB_PORT} → ${DB_NAME_INTEGRATION} (user: ${DB_USER_INTEGRATION}), ${DB_TUNNEL_PRODUCTION}:${DB_PORT} → ${DB_NAME_PRODUCTION} (user: ${DB_USER_PRODUCTION})"
+  echo -e "  \033[33mTeleport:\033[0m ${TELEPORT_PROXY} (auth: ${TELEPORT_AUTH})"
+  echo -e "  \033[90m(Override these using environment variables before running the script)\033[0m"
+  echo ""
+  export CONFIG_SHOWN=1
+fi
+
+# Make sure fzf is installed before proceeding
+if ! command -v fzf >/dev/null 2>&1; then
+  echo "Installing fzf (required for menu)..."
+  install_fzf
+fi
 
 # Start the interactive menu
 main_menu
+
+# The script will exit here after main_menu finishes.
+echo "Goodbye!"
+exit 0
