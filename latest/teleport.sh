@@ -200,7 +200,8 @@ tp() {
           fi
 
           # Drop accidental --db-user flags silently
-          local passthrough=() skip_next=0 a
+          local -a passthrough=()
+          local skip_next=0 a
           for a in "$@"; do
             if [ "$skip_next" -eq 1 ]; then skip_next=0; continue; fi
             case "$a" in
@@ -210,7 +211,12 @@ tp() {
             esac
           done
 
-          tsh db login "$dbsvc" --db-user="$dbuser" --db-name="$dbname" "${passthrough[@]}"
+          local -a login_args=("$dbsvc" "--db-user=$dbuser" "--db-name=$dbname")
+          if [ ${#passthrough[@]} -gt 0 ]; then
+            login_args+=("${passthrough[@]}")
+          fi
+
+          tsh db login "${login_args[@]}"
           ;;
 
         ""|help|HELP)
